@@ -17,7 +17,7 @@ use serde_json;
 use log::{error, info, warn};
 
 pub struct MediaPlayer {
-    video_window: Option<VideoWindow<'static>>,
+    video_window: Option<VideoWindow>,
     audio_player: Option<AudioPlayer>,
     decoder: Option<Arc<MediaDecoder>>,  // Use Arc for shared ownership
     decode_thread: Option<std::thread::JoinHandle<()>>,  // Track decode thread
@@ -306,8 +306,9 @@ impl MediaPlayer {
         // Use simpler format selection for better compatibility
         let output = Command::new("yt-dlp")
             .args([
-                "-j", 
-                "-f", "best[height<=1080]/best", 
+                "-j",
+                "-f", "best[height<=1080]/best",
+                "-t", "sleep",
                 url
             ])
             .output()

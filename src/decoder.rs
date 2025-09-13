@@ -16,6 +16,7 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub pitch: u32, // Add pitch field
     pub timestamp: f64,
     pub frame_number: u64,
 }
@@ -129,7 +130,7 @@ impl MediaDecoder {
             Pixel::RGB24,
             decoder.width(),
             decoder.height(),
-            Flags::BILINEAR,
+            Flags::BICUBIC,
         )?;
 
         let mut frame_number = 0u64;
@@ -138,8 +139,13 @@ impl MediaDecoder {
         let mut rgb_frame = Video::empty();
         
         // Frame timing for proper playback speed
-        let target_fps = 30.0; // Target 30 FPS
-        let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
+        let actual_fps = input_stream.avg_frame_rate().numerator() as f64 / input_stream.avg_frame_rate().denominator() as f64;
+        let frame_duration = if actual_fps > 0.0 {
+            Duration::from_secs_f64(1.0 / actual_fps)
+        } else {
+            warn!("Could not determine video FPS, defaulting to 30 FPS.");
+            Duration::from_secs_f64(1.0 / 30.0)
+        };
         let mut last_frame_time = Instant::now();
 
         info!("Starting video packet processing...");
@@ -171,7 +177,7 @@ impl MediaDecoder {
                     let timestamp = if decoded_frame.pts().is_some() {
                         decoded_frame.pts().unwrap() as f64 * f64::from(time_base)
                     } else {
-                        frame_number as f64 / target_fps
+                        frame_number as f64 / if actual_fps > 0.0 { actual_fps } else { 30.0 }
                     };
 
                     // Copy RGB data
@@ -181,6 +187,7 @@ impl MediaDecoder {
                         data: rgb_data,
                         width: rgb_frame.width(),
                         height: rgb_frame.height(),
+                        pitch: rgb_frame.stride(0) as u32, // Store the actual pitch
                         timestamp,
                         frame_number,
                     };
@@ -221,7 +228,7 @@ impl MediaDecoder {
                 let timestamp = if decoded_frame.pts().is_some() {
                     decoded_frame.pts().unwrap() as f64 * f64::from(time_base)
                 } else {
-                    frame_number as f64 / target_fps
+                    frame_number as f64 / if actual_fps > 0.0 { actual_fps } else { 30.0 }
                 };
 
                 let rgb_data = rgb_frame.data(0).to_vec();
@@ -230,6 +237,7 @@ impl MediaDecoder {
                     data: rgb_data,
                     width: rgb_frame.width(),
                     height: rgb_frame.height(),
+                    pitch: rgb_frame.stride(0) as u32, // Store the actual pitch
                     timestamp,
                     frame_number,
                 };
