@@ -1,4 +1,4 @@
-// src/decoder.rs
+// src/decoder.rs - FIXED VERSION
 use crate::error::{PlayerError, Result};
 use ffmpeg_next::{
     codec, format, frame::{Audio, Video},
@@ -8,6 +8,8 @@ use ffmpeg_next::{
 };
 use crossbeam_channel::Sender;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::time::{Duration, Instant};
+use log::{error, info, warn};
 
 #[derive(Clone)]
 pub struct VideoFrame {
@@ -50,6 +52,7 @@ impl MediaDecoder {
 
     pub fn decode_streams(&self, video_path: &str, audio_path: &str) -> Result<()> {
         ffmpeg_next::init()?;
+        info!("Starting decode_streams for video: {}, audio: {}", video_path, audio_path);
 
         let video_handle = if let Some(sender) = &self.video_sender {
             let sender = sender.clone();
@@ -76,13 +79,13 @@ impl MediaDecoder {
         // Wait for both threads to complete
         if let Some(handle) = video_handle {
             if let Err(e) = handle.join().unwrap() {
-                log::error!("Video decoding error: {:?}", e);
+                error!("Video decoding error: {:?}", e);
             }
         }
 
         if let Some(handle) = audio_handle {
             if let Err(e) = handle.join().unwrap() {
-                log::error!("Audio decoding error: {:?}", e);
+                error!("Audio decoding error: {:?}", e);
             }
         }
 
@@ -94,30 +97,29 @@ impl MediaDecoder {
         sender: Sender<VideoFrame>,
         should_stop: Arc<AtomicBool>,
     ) -> Result<()> {
-        log::debug!("Attempting to decode video stream for path: {}", video_path);
-        ffmpeg_next::init()?;
-        log::debug!("ffmpeg_next::init() successful in decode_video_stream.");
-
-        let mut input_ctx = format::input(&video_path).map_err(|e| {
-            log::error!("Failed to open input context for video path '{}': {:?}", video_path, e);
-            PlayerError::FFmpeg(e)
-        })?;
-        log::debug!("Input context successfully opened for video path: {}", video_path);
+        info!("Starting video decoding for: {}", video_path);
+        
+        let mut input_ctx = format::input(&video_path)
+            .map_err(|e| {
+                error!("Failed to open video input '{}': {:?}", video_path, e);
+                PlayerError::FFmpeg(e)
+            })?;
 
         let input_stream = input_ctx
             .streams()
             .best(Type::Video)
             .ok_or_else(|| {
-                log::error!("Could not find video stream in {}", video_path);
+                error!("Could not find video stream in {}", video_path);
                 PlayerError::Video("Could not find video stream".to_string())
             })?;
-        log::debug!("Video stream found at index: {}", input_stream.index());
-        log::debug!("Starting to process packets for video stream...");
         
         let video_stream_index = input_stream.index();
         let context = codec::context::Context::from_parameters(input_stream.parameters())?;
         let mut decoder = context.decoder().video()?;
-        log::debug!("Video decoder initialized: {}x{}", decoder.width(), decoder.height());
+        
+        info!("Video decoder initialized: {}x{} @ {} fps", 
+              decoder.width(), decoder.height(), 
+              input_stream.avg_frame_rate().numerator() as f64 / input_stream.avg_frame_rate().denominator() as f64);
 
         // Create scaling context for YUV to RGB conversion
         let mut scaler = scaling::Context::get(
@@ -129,46 +131,47 @@ impl MediaDecoder {
             decoder.height(),
             Flags::BILINEAR,
         )?;
-        log::debug!("Scaler initialized.");
 
         let mut frame_number = 0u64;
         let time_base = input_stream.time_base();
         let mut decoded_frame = Video::empty();
         let mut rgb_frame = Video::empty();
-        log::debug!("Starting video packet processing loop.");
+        
+        // Frame timing for proper playback speed
+        let target_fps = 30.0; // Target 30 FPS
+        let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
+        let mut last_frame_time = Instant::now();
+
+        info!("Starting video packet processing...");
 
         for (stream, packet) in input_ctx.packets() {
-            log::debug!("Video stream: Received packet (PTS: {:?}, DTS: {:?})", packet.pts(), packet.dts());
             if should_stop.load(Ordering::SeqCst) {
-                log::debug!("Video decoding stopped by request.");
+                info!("Video decoding stopped by request");
                 break;
             }
 
             if stream.index() == video_stream_index {
-                log::debug!("Sending packet to video decoder (PTS: {:?})", packet.pts());
                 if let Err(e) = decoder.send_packet(&packet) {
-                    log::error!("Failed to send video packet: {:?}", e);
-                    continue; // Continue to next packet or handle error
+                    warn!("Failed to send video packet: {:?}", e);
+                    continue;
                 }
                 
                 while decoder.receive_frame(&mut decoded_frame).is_ok() {
-                    log::debug!("Received frame from video decoder (PTS: {:?})", decoded_frame.pts());
                     if should_stop.load(Ordering::SeqCst) {
-                        log::debug!("Video decoding stopped by request during frame reception.");
                         break;
                     }
 
                     // Convert YUV frame to RGB
                     if let Err(e) = scaler.run(&decoded_frame, &mut rgb_frame) {
-                        log::error!("Failed to scale video frame: {:?}", e);
-                        continue; // Skip this frame and try next
+                        warn!("Failed to scale video frame: {:?}", e);
+                        continue;
                     }
                     
                     // Calculate timestamp
                     let timestamp = if decoded_frame.pts().is_some() {
                         decoded_frame.pts().unwrap() as f64 * f64::from(time_base)
                     } else {
-                        frame_number as f64 / 30.0 // Fallback to 30fps assumption
+                        frame_number as f64 / target_fps
                     };
 
                     // Copy RGB data
@@ -181,51 +184,64 @@ impl MediaDecoder {
                         timestamp,
                         frame_number,
                     };
-                    log::debug!("Decoded video frame {} ({}x{}) at timestamp {}", frame_number, rgb_frame.width(), rgb_frame.height(), timestamp);
 
+                    // Send frame
                     if sender.send(video_frame).is_err() {
-                        log::warn!("Video receiver disconnected, stopping video decoding.");
-                        return Ok(()); // Receiver disconnected, stop decoding
+                        info!("Video receiver disconnected, stopping video decoding");
+                        return Ok(());
                     }
 
                     frame_number += 1;
 
-                    // Simple frame rate limiting (30 FPS)
-                    // This sleep might be too long and cause issues if frames are not coming fast enough
-                    std::thread::sleep(std::time::Duration::from_millis(1)); // Reduced sleep for testing
+                    // Frame rate limiting with proper timing
+                    let elapsed = last_frame_time.elapsed();
+                    if elapsed < frame_duration {
+                        let sleep_duration = frame_duration - elapsed;
+                        std::thread::sleep(sleep_duration);
+                    }
+                    last_frame_time = Instant::now();
+
+                    // Progress logging every 300 frames (10 seconds at 30fps)
+                    if frame_number % 300 == 0 {
+                        info!("Decoded {} video frames, timestamp: {:.2}s", frame_number, timestamp);
+                    }
                 }
             }
         }
 
         // Flush decoder
-        decoder.send_eof()?;
-        while decoder.receive_frame(&mut decoded_frame).is_ok() {
-            scaler.run(&decoded_frame, &mut rgb_frame)?;
-            
-            let timestamp = if decoded_frame.pts().is_some() {
-                decoded_frame.pts().unwrap() as f64 * f64::from(time_base)
-            } else {
-                frame_number as f64 / 30.0
-            };
+        if let Err(e) = decoder.send_eof() {
+            warn!("Failed to send EOF to video decoder: {:?}", e);
+        } else {
+            while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                if let Err(_) = scaler.run(&decoded_frame, &mut rgb_frame) {
+                    continue;
+                }
+                
+                let timestamp = if decoded_frame.pts().is_some() {
+                    decoded_frame.pts().unwrap() as f64 * f64::from(time_base)
+                } else {
+                    frame_number as f64 / target_fps
+                };
 
-            let rgb_data = rgb_frame.data(0).to_vec();
-            
-            let video_frame = VideoFrame {
-                data: rgb_data,
-                width: rgb_frame.width(),
-                height: rgb_frame.height(),
-                timestamp,
-                frame_number,
-            };
+                let rgb_data = rgb_frame.data(0).to_vec();
+                
+                let video_frame = VideoFrame {
+                    data: rgb_data,
+                    width: rgb_frame.width(),
+                    height: rgb_frame.height(),
+                    timestamp,
+                    frame_number,
+                };
 
-            if sender.send(video_frame).is_err() {
-                break;
+                if sender.send(video_frame).is_err() {
+                    break;
+                }
+                frame_number += 1;
             }
-
-            frame_number += 1;
         }
 
-        println!("✅ Video decoding completed. Total frames: {}", frame_number);
+        info!("✅ Video decoding completed. Total frames: {}", frame_number);
         Ok(())
     }
 
@@ -234,14 +250,13 @@ impl MediaDecoder {
         sender: Sender<AudioSample>,
         should_stop: Arc<AtomicBool>,
     ) -> Result<()> {
-        log::debug!("Attempting to decode audio stream for path: {}", audio_path);
-        ffmpeg_next::init()?;
-        log::debug!("ffmpeg_next::init() successful in decode_audio_stream.");
-        let mut input_ctx = format::input(&audio_path).map_err(|e| {
-            log::error!("Failed to open input context for audio path '{}': {:?}", audio_path, e);
-            PlayerError::FFmpeg(e)
-        })?;
-        log::debug!("Input context successfully opened for audio path: {}", audio_path);
+        info!("Starting audio decoding for: {}", audio_path);
+        
+        let mut input_ctx = format::input(&audio_path)
+            .map_err(|e| {
+                error!("Failed to open audio input '{}': {:?}", audio_path, e);
+                PlayerError::FFmpeg(e)
+            })?;
 
         let input_stream = input_ctx
             .streams()
@@ -251,6 +266,9 @@ impl MediaDecoder {
         let audio_stream_index = input_stream.index();
         let context = codec::context::Context::from_parameters(input_stream.parameters())?;
         let mut decoder = context.decoder().audio()?;
+
+        info!("Audio decoder initialized: {} Hz, {} channels", 
+              decoder.rate(), decoder.channels());
 
         // Create resampler to convert to f32 samples
         let mut resampler = resampling::Context::get(
@@ -267,15 +285,21 @@ impl MediaDecoder {
         let mut resampled_audio = Audio::empty();
         let sample_rate = decoder.rate();
         let channels = decoder.channels();
+        let mut sample_count = 0usize;
+
+        info!("Starting audio packet processing...");
 
         for (_stream, packet) in input_ctx.packets() {
-            log::debug!("Audio stream: Received packet (PTS: {:?}, DTS: {:?})", packet.pts(), packet.dts());
             if should_stop.load(Ordering::SeqCst) {
+                info!("Audio decoding stopped by request");
                 break;
             }
 
             if packet.stream() == audio_stream_index {
-                decoder.send_packet(&packet)?;
+                if let Err(e) = decoder.send_packet(&packet) {
+                    warn!("Failed to send audio packet: {:?}", e);
+                    continue;
+                }
                 
                 while decoder.receive_frame(&mut decoded_audio).is_ok() {
                     if should_stop.load(Ordering::SeqCst) {
@@ -283,17 +307,21 @@ impl MediaDecoder {
                     }
 
                     // Resample audio to f32
-                    resampler.run(&decoded_audio, &mut resampled_audio)?;
+                    if let Err(e) = resampler.run(&decoded_audio, &mut resampled_audio) {
+                        warn!("Failed to resample audio: {:?}", e);
+                        continue;
+                    }
                     
                     // Calculate timestamp
                     let timestamp = if decoded_audio.pts().is_some() {
                         decoded_audio.pts().unwrap() as f64 * f64::from(time_base)
                     } else {
-                        0.0
+                        sample_count as f64 / sample_rate as f64
                     };
 
                     // Convert audio data to Vec<f32>
                     let audio_data = Self::extract_f32_samples(&resampled_audio);
+                    sample_count += audio_data.len();
                     
                     let audio_sample = AudioSample {
                         data: audio_data,
@@ -303,7 +331,7 @@ impl MediaDecoder {
                     };
 
                     if sender.send(audio_sample).is_err() {
-                        log::warn!("Audio receiver disconnected");
+                        info!("Audio receiver disconnected");
                         return Ok(());
                     }
                 }
@@ -311,31 +339,37 @@ impl MediaDecoder {
         }
 
         // Flush decoder
-        decoder.send_eof()?;
-        while decoder.receive_frame(&mut decoded_audio).is_ok() {
-            resampler.run(&decoded_audio, &mut resampled_audio)?;
-            
-            let timestamp = if decoded_audio.pts().is_some() {
-                decoded_audio.pts().unwrap() as f64 * f64::from(time_base)
-            } else {
-                0.0
-            };
+        if let Err(e) = decoder.send_eof() {
+            warn!("Failed to send EOF to audio decoder: {:?}", e);
+        } else {
+            while decoder.receive_frame(&mut decoded_audio).is_ok() {
+                if let Err(_) = resampler.run(&decoded_audio, &mut resampled_audio) {
+                    continue;
+                }
+                
+                let timestamp = if decoded_audio.pts().is_some() {
+                    decoded_audio.pts().unwrap() as f64 * f64::from(time_base)
+                } else {
+                    sample_count as f64 / sample_rate as f64
+                };
 
-            let audio_data = Self::extract_f32_samples(&resampled_audio);
-            
-            let audio_sample = AudioSample {
-                data: audio_data,
-                sample_rate,
-                channels,
-                timestamp,
-            };
+                let audio_data = Self::extract_f32_samples(&resampled_audio);
+                sample_count += audio_data.len();
+                
+                let audio_sample = AudioSample {
+                    data: audio_data,
+                    sample_rate,
+                    channels,
+                    timestamp,
+                };
 
-            if sender.send(audio_sample).is_err() {
-                break;
+                if sender.send(audio_sample).is_err() {
+                    break;
+                }
             }
         }
 
-        println!("✅ Audio decoding completed");
+        info!("✅ Audio decoding completed. Total samples: {}", sample_count);
         Ok(())
     }
 

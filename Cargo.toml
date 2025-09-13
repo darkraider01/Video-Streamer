@@ -4,26 +4,45 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Existing dependencies
+# Core async and HTTP
 reqwest = { version = "0.12", features = ["stream"] }
 tokio = { version = "1", features = ["full"] }
+
+# Media processing
 ffmpeg-next = "7.1.0"
+
+# GUI and rendering
+sdl2 = { version = "0.36", features = ["bundled"] }
+
+# Audio playback
+rodio = "0.17"
+
+# Concurrency
+crossbeam-channel = "0.5"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
 log = "0.4"
 env_logger = "0.10"
 
-# New essential dependencies for complete implementation
-sdl2 = { version = "0.36", features = ["bundled"] }
-rodio = "0.17"
-crossbeam-channel = "0.5"
-anyhow = "1.0"
-thiserror = "1.0"
+# JSON parsing for yt-dlp output
 serde_json = "1.0.143"
 
-# For GUI (optional - can be enabled later)
-# egui = { version = "0.24", optional = true }
-# egui-winit = { version = "0.24", optional = true }
-# egui_glow = { version = "0.24", optional = true }
+[profile.dev]
+opt-level = 1  # Some optimization for better development experience
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"  # Smaller binary size
+
+# Optional features for future expansion
 [features]
 default = []
-# gui = ["egui", "egui-winit", "egui_glow"]
+hardware-accel = []  # Future: hardware video decoding
+subtitles = []       # Future: subtitle support
+gui-controls = []    # Future: GUI controls

@@ -1,4 +1,4 @@
-// src/player.rs
+// src/player.rs - FIXED VERSION
 use crate::{
     audio::AudioPlayer,
     decoder::MediaDecoder,
@@ -14,12 +14,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use serde_json;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 
 pub struct MediaPlayer {
-    video_window: Option<VideoWindow>,
+    video_window: Option<VideoWindow<'static>>,
     audio_player: Option<AudioPlayer>,
-    decoder: Option<MediaDecoder>,
+    decoder: Option<Arc<MediaDecoder>>,  // Use Arc for shared ownership
+    decode_thread: Option<std::thread::JoinHandle<()>>,  // Track decode thread
     is_running: Arc<AtomicBool>,
     is_paused: Arc<AtomicBool>,
     current_url: Option<String>,
@@ -31,6 +32,7 @@ impl MediaPlayer {
             video_window: None,
             audio_player: None,
             decoder: None,
+            decode_thread: None,
             is_running: Arc::new(AtomicBool::new(false)),
             is_paused: Arc::new(AtomicBool::new(false)),
             current_url: None,
@@ -38,184 +40,210 @@ impl MediaPlayer {
     }
 
     pub fn load_url(&mut self, url: &str) -> Result<()> {
-        println!("🔄 Loading URL: {}", url);
+        info!("🔄 Loading URL: {}", url);
         self.current_url = Some(url.to_string());
+
+        // Stop any existing playback
+        self.stop_internal();
 
         // Extract video and audio URLs using yt-dlp
         let (video_url, audio_url) = self.extract_stream_urls(url)?;
         
-        println!("✅ Got video stream URL");
-        println!("✅ Got audio stream URL");
+        info!("✅ Got stream URLs - Video: {}..., Audio: {}...", 
+              &video_url[..std::cmp::min(50, video_url.len())],
+              &audio_url[..std::cmp::min(50, audio_url.len())]);
 
-        // Create communication channels
+        // Create communication channels with larger capacity to prevent blocking
         let (video_sender, video_receiver) = unbounded();
         let (audio_sender, audio_receiver) = unbounded();
 
         // Initialize video renderer
         self.video_window = Some(VideoWindow::new(
             video_receiver,
-            1024,
-            768,
+            1280,  // Increased default size
+            720,
             "Rust Video Streamer",
         )?);
-        println!("✅ Video renderer initialized");
+        info!("✅ Video renderer initialized");
 
         // Initialize audio player
-        let mut audio_player = AudioPlayer::new(audio_receiver)?;
+        let audio_player = AudioPlayer::new(audio_receiver)?;
         audio_player.start_playback()?;
         self.audio_player = Some(audio_player);
-        println!("✅ Audio player initialized");
+        info!("✅ Audio player initialized");
 
-        // Initialize decoder
-        let decoder = MediaDecoder::new(Some(video_sender), Some(audio_sender));
-        self.decoder = Some(decoder);
+        // Initialize decoder with Arc for shared ownership
+        let decoder = Arc::new(MediaDecoder::new(Some(video_sender), Some(audio_sender)));
+        let decoder_clone = decoder.clone();
         
-        let video_url_for_thread = video_url.clone();
-        let audio_url_for_thread = audio_url.clone();
-
-        if let Some(main_decoder) = &self.decoder {
-            let should_stop_clone = main_decoder.should_stop.clone();
-            std::thread::spawn(move || {
-                let mut thread_decoder = MediaDecoder::new(None, None); // This decoder is only for calling decode_streams
-                thread_decoder.should_stop = should_stop_clone; // Transfer ownership of the Arc
-                if let Err(e) = thread_decoder.decode_streams(&video_url_for_thread, &audio_url_for_thread) {
-                    log::error!("Decoding error: {:?}", e);
-                }
-            });
-        }
-        println!("✅ Media decoder started");
+        // Start decoding in background thread
+        let video_url_clone = video_url.clone();
+        let audio_url_clone = audio_url.clone();
+        
+        let decode_handle = std::thread::spawn(move || {
+            info!("🎬 Starting decoder thread");
+            if let Err(e) = decoder_clone.decode_streams(&video_url_clone, &audio_url_clone) {
+                error!("Decoding error: {:?}", e);
+            } else {
+                info!("🎬 Decoder thread completed successfully");
+            }
+        });
+        
+        self.decoder = Some(decoder);
+        self.decode_thread = Some(decode_handle);
+        info!("✅ Media decoder started");
 
         Ok(())
     }
 
     pub fn run(&mut self) -> Result<()> {
         if self.video_window.is_none() {
-            return Err(PlayerError::Video("No media loaded".to_string()));
+            return Err(PlayerError::Video("No media loaded. Call load_url() first".to_string()));
         }
 
         self.is_running.store(true, Ordering::SeqCst);
-        println!("🎬 Starting playback...");
+        info!("🎬 Starting playback loop...");
         self.resume();
 
         let mut frame_count = 0;
         let start_time = std::time::Instant::now();
+        let mut last_stats_time = start_time;
 
         'running: loop {
-            debug!("MediaPlayer loop running...");
             if !self.is_running.load(Ordering::SeqCst) {
+                info!("Main loop stopping...");
                 break;
             }
 
-            // Handle SDL events
-            let mut keycode = None;
+            let mut events_to_process = vec![];
             if let Some(ref mut video_window) = self.video_window {
                 for event in video_window.event_pump.poll_iter() {
-                    match event {
-                        Event::Quit { .. } => {
-                            println!("👋 Quit requested");
-                            self.is_running.store(false, Ordering::SeqCst);
+                    events_to_process.push(event);
+                }
+            }
+
+            for event in events_to_process {
+                match event {
+                    Event::Quit { .. } => {
+                        info!("👋 Quit requested via window close");
+                        self.is_running.store(false, Ordering::SeqCst);
+                        break 'running;
+                    }
+                    Event::KeyDown {
+                        keycode: Some(keycode),
+                        ..
+                    } => {
+                        if self.handle_keypress(keycode) {
+                            break 'running;
                         }
-                        Event::KeyDown {
-                            keycode: Some(k),
-                            ..
-                        } => {
-                           keycode = Some(k);
-                        }
-                        Event::Window { win_event, .. } => {
+                    }
+                    Event::Window { win_event, .. } => {
+                        if let Some(ref mut video_window) = self.video_window {
                             match win_event {
                                 sdl2::event::WindowEvent::Resized(_, _) => {
-                                    video_window.renderer.handle_window_resize()?;
+                                    if let Err(e) = video_window.renderer.handle_window_resize() {
+                                        warn!("Failed to handle window resize: {:?}", e);
+                                    }
                                 }
                                 _ => {}
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
-            if let Some(keycode) = keycode {
-                self.handle_keypress(keycode);
-            }
 
-            // Update video renderer
             if let Some(ref mut video_window) = self.video_window {
-                let frame_updated = video_window.renderer.update()?;
-                if frame_updated {
-                    frame_count += 1;
+                // Update video renderer
+                match video_window.renderer.update() {
+                    Ok(frame_updated) => {
+                        if frame_updated {
+                            frame_count += 1;
 
-                    // Print stats every 100 frames
-                    if frame_count % 100 == 0 {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let fps = frame_count as f64 / elapsed;
-                        
-                        if let Some((width, height, timestamp, frame_num)) =
-                            video_window.renderer.get_current_frame_info() {
-                            println!(
-                                "📊 Frame: {} | {}x{} | Time: {:.2}s | FPS: {:.1}",
-                                frame_num, width, height, timestamp, fps
-                            );
+                            // Print stats every 10 seconds
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_stats_time).as_secs() >= 10 {
+                                let elapsed = start_time.elapsed().as_secs_f64();
+                                let fps = frame_count as f64 / elapsed;
+                                
+                                if let Some((width, height, timestamp, frame_num)) =
+                                    video_window.renderer.get_current_frame_info() {
+                                    info!(
+                                        "📊 Stats - Frame: {} | {}x{} | Time: {:.1}s | Avg FPS: {:.1}",
+                                        frame_num, width, height, timestamp, fps
+                                    );
+                                }
+                                last_stats_time = now;
+                            }
                         }
                     }
+                    Err(e) => {
+                        error!("Video renderer error: {:?}", e);
+                        // Continue running despite renderer errors
+                    }
                 }
             }
 
-            // Small delay to prevent excessive CPU usage
+            // Prevent excessive CPU usage
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        self.stop();
+        info!("🛑 Playback loop ended");
+        self.stop_internal();
         Ok(())
     }
 
-    fn handle_keypress(&mut self, keycode: Keycode) {
-        let is_paused = self.is_paused();
+    fn handle_keypress(&mut self, keycode: Keycode) -> bool {
+        let mut quit = false;
         match keycode {
-             Keycode::Space => {
-                 if is_paused {
-                     println!("▶ Resuming playback");
-                     self.resume();
-                 } else {
-                     println!("⏸ Pausing playback");
-                     self.pause();
-                 }
-             }
-             Keycode::Q | Keycode::Escape => {
-                 println!("👋 Quit requested");
-                 self.is_running.store(false, Ordering::SeqCst);
-             }
-             Keycode::Up => {
-                 // Volume up
-                 if let Some(ref audio_player) = self.audio_player {
-                     let current_vol = audio_player.get_volume();
-                     let new_vol = (current_vol + 10).min(100);
-                     audio_player.set_volume(new_vol);
-                     println!("🔊 Volume: {}%", new_vol);
-                 }
-             }
-             Keycode::Down => {
-                 // Volume down
-                 if let Some(ref audio_player) = self.audio_player {
-                     let current_vol = audio_player.get_volume();
-                     let new_vol = current_vol.saturating_sub(10);
-                     audio_player.set_volume(new_vol);
-                     println!("🔉 Volume: {}%", new_vol);
-                 }
-             }
-             Keycode::M => {
-                 // Mute/unmute
-                 if let Some(ref audio_player) = self.audio_player {
-                     let current_vol = audio_player.get_volume();
-                     if current_vol > 0 {
-                         audio_player.set_volume(0);
-                         println!("🔇 Muted");
-                     } else {
-                         audio_player.set_volume(50);
-                         println!("🔊 Unmuted (50%)");
-                     }
-                 }
-             }
-             _ => {}
+            Keycode::Space => {
+                if self.is_paused() {
+                    info!("▶ Resuming playback");
+                    self.resume();
+                } else {
+                    info!("⏸ Pausing playback");
+                    self.pause();
+                }
+            }
+            Keycode::Q | Keycode::Escape => {
+                info!("👋 Quit requested via keyboard");
+                self.is_running.store(false, Ordering::SeqCst);
+                quit = true;
+            }
+            Keycode::Up => {
+                // Volume up
+                if let Some(ref audio_player) = self.audio_player {
+                    let current_vol = audio_player.get_volume();
+                    let new_vol = (current_vol + 10).min(100);
+                    audio_player.set_volume(new_vol);
+                    info!("🔊 Volume: {}%", new_vol);
+                }
+            }
+            Keycode::Down => {
+                // Volume down
+                if let Some(ref audio_player) = self.audio_player {
+                    let current_vol = audio_player.get_volume();
+                    let new_vol = current_vol.saturating_sub(10);
+                    audio_player.set_volume(new_vol);
+                    info!("🔉 Volume: {}%", new_vol);
+                }
+            }
+            Keycode::M => {
+                // Mute/unmute
+                if let Some(ref audio_player) = self.audio_player {
+                    let current_vol = audio_player.get_volume();
+                    if current_vol > 0 {
+                        audio_player.set_volume(0);
+                        info!("🔇 Muted");
+                    } else {
+                        audio_player.set_volume(50);
+                        info!("🔊 Unmuted (50%)");
+                    }
+                }
+            }
+            _ => {}
         }
+        quit
     }
 
     pub fn pause(&self) {
@@ -232,21 +260,36 @@ impl MediaPlayer {
         }
     }
 
-    pub fn stop(&self) {
-        println!("⏹ Stopping playback...");
+    fn stop_internal(&mut self) {
+        info!("🛑 Stopping internal components...");
         self.is_running.store(false, Ordering::SeqCst);
         
+        // Stop audio player
         if let Some(ref audio_player) = self.audio_player {
             audio_player.stop();
         }
         
+        // Stop decoder
         if let Some(ref decoder) = self.decoder {
             decoder.stop();
         }
         
+        // Stop video renderer
         if let Some(ref video_window) = self.video_window {
             video_window.renderer.stop();
         }
+
+        // Wait for decode thread to finish
+        if let Some(handle) = self.decode_thread.take() {
+            info!("Waiting for decoder thread to finish...");
+            let _ = handle.join();
+            info!("Decoder thread finished");
+        }
+    }
+
+    pub fn stop(&mut self) {
+        info!("⏹ Stopping playback...");
+        self.stop_internal();
     }
 
     pub fn is_paused(&self) -> bool {
@@ -258,10 +301,15 @@ impl MediaPlayer {
     }
 
     fn extract_stream_urls(&self, url: &str) -> Result<(String, String)> {
-        println!("🔍 Extracting stream URLs with yt-dlp...");
+        info!("🔍 Extracting stream URLs with yt-dlp...");
 
+        // Use simpler format selection for better compatibility
         let output = Command::new("yt-dlp")
-            .args(["-j", "-f", "bestvideo[ext=mp4]/bestvideo[ext=webm]+bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio[ext=aac]/bestaudio/best[height<=1080][ext!=webm][ext!=mhtml]/best[height<=720][ext!=webm][ext!=mhtml]/best[ext!=webm][ext!=mhtml]", url])
+            .args([
+                "-j", 
+                "-f", "best[height<=1080]/best", 
+                url
+            ])
             .output()
             .map_err(PlayerError::Io)?;
 
@@ -280,101 +328,82 @@ impl MediaPlayer {
                 format!("Failed to parse yt-dlp JSON output: {}", e),
             )))?;
 
+        // Try to get direct URL first
+        if let Some(url_str) = json["url"].as_str() {
+            info!("Using direct URL from yt-dlp");
+            return Ok((url_str.to_string(), url_str.to_string()));
+        }
+
+        // Otherwise, parse formats array
         let formats = json["formats"].as_array().ok_or_else(|| PlayerError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             "No formats found in yt-dlp output",
         )))?;
 
-        let get_best_url = |formats: &Vec<serde_json::Value>, is_video: bool| -> Option<String> {
-            let mut best_format_url: Option<String> = None;
-            let mut best_quality_score: u64 = 0;
-            let mut fallback_url: Option<String> = None; // Added for fallback
+        // Find best video format
+        let mut best_video_url: Option<String> = None;
+        let mut best_video_quality = 0u64;
 
-            for format in formats {
-                let url = format["url"].as_str();
-                if url.is_none() {
-                    debug!("Skipping format with no URL: {:?}", format);
-                    continue;
-                }
+        // Find best audio format  
+        let mut best_audio_url: Option<String> = None;
+        let mut best_audio_bitrate = 0u64;
 
-                let current_url = url.unwrap().to_string();
-                let ext = format["ext"].as_str().unwrap_or("");
-                let protocol = format["protocol"].as_str().unwrap_or("");
-                let format_id = format["format_id"].as_str().unwrap_or("");
+        for format in formats {
+            let url_opt = format["url"].as_str();
+            if url_opt.is_none() {
+                continue;
+            }
+            let format_url = url_opt.unwrap().to_string();
 
-                // Skip formats that are not direct URLs or are HLS/DASH manifests
-                if protocol.contains("m3u8") || protocol.contains("dash") || ext == "mpd" || format_id.contains("hls") || format_id.contains("dash") {
-                    debug!("Skipping manifest/non-direct format: {:?}", format);
-                    continue;
-                }
-                
-                // Keep track of any valid direct URL for fallback
-                if fallback_url.is_none() {
-                    fallback_url = Some(current_url.clone());
-                }
+            // Skip HLS/DASH manifests
+            let protocol = format["protocol"].as_str().unwrap_or("");
+            if protocol.contains("m3u8") || protocol.contains("dash") {
+                continue;
+            }
 
-                if is_video {
-                    let vcodec = format["vcodec"].as_str().unwrap_or("none");
-                    let height = format["height"].as_u64().unwrap_or(0);
-                    let filesize = format["filesize"].as_u64().unwrap_or(0);
-
-                    // Prioritize formats with actual video codecs and higher resolution
-                    let mut quality_score = height;
-                    if vcodec != "none" && vcodec != "true" { // 'true' can sometimes be a placeholder
-                        quality_score += 10000; // Boost score for actual video streams
-                    }
-                    if ext == "mp4" {
-                        quality_score += 5000; // Prefer mp4
-                    }
-                    if filesize > 0 { // Prefer formats with known file size
-                        quality_score += 1000;
-                    }
-
-                    debug!("Video format considered: {:?} with score {}", format, quality_score);
-
-                    if quality_score > best_quality_score {
-                        best_quality_score = quality_score;
-                        best_format_url = Some(current_url.clone());
-                        debug!("Found better video format: {:?} with score {}", format, quality_score);
-                    }
-                } else { // Audio
-                    let acodec = format["acodec"].as_str().unwrap_or("none");
-                    let abr = format["abr"].as_f64().unwrap_or(0.0) as u64; // Average Bitrate
-                    let filesize = format["filesize"].as_u64().unwrap_or(0);
-
-                    // Prioritize formats with actual audio codecs and higher bitrate
-                    let mut quality_score = abr;
-                    if acodec != "none" && acodec != "true" {
-                        quality_score += 10000; // Boost score for actual audio streams
-                    }
-                    if ext == "m4a" || ext == "webm" { // Prefer m4a or webm for audio
-                        quality_score += 5000;
-                    }
-                     if filesize > 0 { // Prefer formats with known file size
-                        quality_score += 1000;
-                    }
-
-                    debug!("Audio format considered: {:?} with score {}", format, quality_score);
-
-                    if quality_score > best_quality_score {
-                        best_quality_score = quality_score;
-                        best_format_url = Some(current_url.clone());
-                        debug!("Found better audio format: {:?} with score {}", format, quality_score);
-                    }
+            // Check for video format
+            if let Some(height) = format["height"].as_u64() {
+                if height > best_video_quality {
+                    best_video_quality = height;
+                    best_video_url = Some(format_url.clone());
                 }
             }
-            best_format_url.or(fallback_url) // Use fallback if no best format found
-        };
 
-        let video_url = get_best_url(formats, true).ok_or_else(|| PlayerError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "No suitable video URL found in yt-dlp output",
-        )))?;
+            // Check for audio format
+            if let Some(abr) = format["abr"].as_u64() {
+                if abr > best_audio_bitrate {
+                    best_audio_bitrate = abr;
+                    best_audio_url = Some(format_url.clone());
+                }
+            }
 
-        let audio_url = get_best_url(formats, false).ok_or_else(|| PlayerError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "No suitable audio URL found in yt-dlp output",
-        )))?;
+            // Fallback: use any format that has both audio and video
+            if best_video_url.is_none() && best_audio_url.is_none() {
+                if format["vcodec"].as_str().unwrap_or("none") != "none" && 
+                   format["acodec"].as_str().unwrap_or("none") != "none" {
+                    best_video_url = Some(format_url.clone());
+                    best_audio_url = Some(format_url.clone());
+                }
+            }
+        }
+
+        let video_url = best_video_url.as_ref().or_else(|| best_audio_url.as_ref()).cloned()
+            .ok_or_else(|| PlayerError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No suitable video URL found in yt-dlp output",
+            )))?;
+
+        let audio_url = best_audio_url
+            .or_else(|| best_video_url.as_ref().cloned())
+            .ok_or_else(|| {
+                PlayerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "No suitable audio URL found in yt-dlp output",
+                ))
+            })?;
+
+        info!("Selected video quality: {}p, audio bitrate: {}kbps", 
+              best_video_quality, best_audio_bitrate);
 
         Ok((video_url, audio_url))
     }
@@ -394,7 +423,7 @@ impl MediaPlayer {
 
 impl Drop for MediaPlayer {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_internal();
     }
 }
 

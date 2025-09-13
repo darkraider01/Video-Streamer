@@ -1,4 +1,4 @@
-// src/renderer.rs
+// src/renderer.rs - FIXED VERSION
 use crate::{decoder::VideoFrame, error::{PlayerError, Result}};
 use crossbeam_channel::Receiver;
 use sdl2::{
@@ -11,27 +11,32 @@ use sdl2::{
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use log::debug;
 
-pub struct VideoRenderer {
+pub struct VideoRenderer<'a> {
     canvas: Canvas<Window>,
-    texture_creator: TextureCreator<WindowContext>,
+    pub texture_creator: TextureCreator<WindowContext>,
+    current_texture: Option<Texture<'a>>,
     video_receiver: Receiver<VideoFrame>,
     should_stop: Arc<AtomicBool>,
     current_frame: Option<VideoFrame>,
+    last_texture_width: u32,  // Track dimensions for texture reuse
+    last_texture_height: u32,
 }
 
-impl VideoRenderer {
+impl<'a> VideoRenderer<'a> {
     pub fn new(
         canvas: Canvas<Window>,
         video_receiver: Receiver<VideoFrame>,
     ) -> Result<Self> {
         let texture_creator = canvas.texture_creator();
-
         Ok(VideoRenderer {
             canvas,
             texture_creator,
+            current_texture: None,
             video_receiver,
             should_stop: Arc::new(AtomicBool::new(false)),
             current_frame: None,
+            last_texture_width: 0,
+            last_texture_height: 0,
         })
     }
 
@@ -44,15 +49,25 @@ impl VideoRenderer {
             return Ok(false);
         }
 
-        // Try to get the latest frame
+        // Try to get the latest frame (drain all pending frames to avoid lag)
         let mut new_frame_received = false;
+        let mut latest_frame = None;
+        
+        // Drain the queue to get the most recent frame
         while let Ok(frame) = self.video_receiver.try_recv() {
-            self.current_frame = Some(frame);
+            latest_frame = Some(frame);
             new_frame_received = true;
-            debug!("Video frame received: {}x{} at timestamp {}", self.current_frame.as_ref().unwrap().width, self.current_frame.as_ref().unwrap().height, self.current_frame.as_ref().unwrap().timestamp);
+        }
+        
+        if let Some(frame) = latest_frame {
+            self.current_frame = Some(frame);
+            debug!("Video frame received: {}x{} at timestamp {:.2}s", 
+                   self.current_frame.as_ref().unwrap().width, 
+                   self.current_frame.as_ref().unwrap().height, 
+                   self.current_frame.as_ref().unwrap().timestamp);
         }
 
-        // Render current frame if we have one
+        // Always render (even if no new frame)
         self.render_frame()?;
 
         Ok(new_frame_received)
@@ -60,34 +75,54 @@ impl VideoRenderer {
 
     fn render_frame(&mut self) -> Result<()> {
         if let Some(frame) = &self.current_frame {
-            debug!("Rendering frame: {}x{} (Frame num: {})", frame.width, frame.height, frame.frame_number);
-            let mut texture = self.texture_creator.create_texture_streaming(PixelFormatEnum::RGB24, frame.width, frame.height)
-                .map_err(|e| PlayerError::Video(e.to_string()))?;
-            
-            texture
-                .update(None, &frame.data, (frame.width * 3) as usize)
-                .map_err(|e| PlayerError::Video(e.to_string()))?;
+            // CRITICAL FIX: Only create new texture if dimensions changed
+            let needs_new_texture = self.current_texture.is_none() || 
+                                  self.last_texture_width != frame.width || 
+                                  self.last_texture_height != frame.height;
 
-            // Clear canvas and copy texture
-            self.canvas.set_draw_color(Color::RGB(0, 0, 0));
-            self.canvas.clear();
+            if needs_new_texture {
+                debug!("Creating new texture: {}x{}", frame.width, frame.height);
+                let texture = self
+                    .texture_creator
+                    .create_texture_streaming(PixelFormatEnum::RGB24, frame.width, frame.height)
+                    .map_err(|e| PlayerError::Video(format!("Failed to create texture: {}", e)))?;
+                
+                // Unsafely extend the lifetime of the texture
+                let texture: Texture<'a> = unsafe { std::mem::transmute(texture) };
+                self.current_texture = Some(texture);
+                self.last_texture_width = frame.width;
+                self.last_texture_height = frame.height;
+            }
 
-            // Calculate scaling to fit window while maintaining aspect ratio
-            let window_size = self.canvas.output_size().map_err(|e| PlayerError::Sdl(e.to_string()))?;
-            let dst_rect = self.calculate_display_rect(
-                frame.width,
-                frame.height,
-                window_size.0,
-                window_size.1,
-            );
+            // Update texture with frame data
+            let dst_rect = {
+                let window_size = self.canvas.output_size()
+                    .map_err(|e| PlayerError::Sdl(e.to_string()))?;
+                self.calculate_display_rect(
+                    frame.width,
+                    frame.height,
+                    window_size.0,
+                    window_size.1,
+                )
+            };
 
-            self.canvas
-                .copy(&texture, None, Some(dst_rect))
-                .map_err(|e| PlayerError::Video(e.to_string()))?;
+            if let Some(ref mut texture) = self.current_texture {
+                texture
+                    .update(None, &frame.data, (frame.width * 3) as usize)
+                    .map_err(|e| PlayerError::Video(format!("Failed to update texture: {}", e)))?;
 
-            self.canvas.present();
+                // Clear canvas
+                self.canvas.set_draw_color(Color::RGB(0, 0, 0));
+                self.canvas.clear();
+
+                // Copy texture to canvas
+                self.canvas
+                    .copy(texture, None, Some(dst_rect))
+                    .map_err(|e| PlayerError::Video(format!("Failed to copy texture: {}", e)))?;
+
+                self.canvas.present();
+            }
         } else {
-            debug!("No frame to render, clearing canvas.");
             // Clear with black if no frame
             self.canvas.set_draw_color(Color::RGB(0, 0, 0));
             self.canvas.clear();
@@ -122,50 +157,61 @@ impl VideoRenderer {
     }
 
     pub fn handle_window_resize(&mut self) -> Result<()> {
-        // This is now handled by recreating the texture on every frame.
+        // Force texture recreation on next render by clearing current texture
+        self.current_texture = None;
         Ok(())
     }
 }
 
-pub struct VideoWindow {
-    pub sdl_context: sdl2::Sdl,
-    pub video_subsystem: VideoSubsystem,
+pub struct VideoWindow<'a> {
     pub event_pump: EventPump,
-    pub renderer: VideoRenderer,
+    pub renderer: VideoRenderer<'a>,
+    _sdl_context: sdl2::Sdl,
+    _video_subsystem: VideoSubsystem,
 }
 
-impl VideoWindow {
+impl<'a> VideoWindow<'a> {
     pub fn new(
         video_receiver: Receiver<VideoFrame>,
         width: u32,
         height: u32,
         title: &str,
-    ) -> Result<Self> {
-        let sdl_context = sdl2::init().map_err(|e| PlayerError::Sdl(e.to_string()))?;
-        let video_subsystem = sdl_context.video().map_err(|e| PlayerError::Sdl(e.to_string()))?;
-        let event_pump = sdl_context.event_pump().map_err(|e| PlayerError::Sdl(e.to_string()))?;
+    ) -> Result<VideoWindow<'a>> {
+        // Initialize SDL2
+        let sdl_context = sdl2::init()
+            .map_err(|e| PlayerError::Sdl(format!("Failed to initialize SDL2: {}", e)))?;
+        
+        let video_subsystem = sdl_context.video()
+            .map_err(|e| PlayerError::Sdl(format!("Failed to initialize SDL2 video: {}", e)))?;
+        
+        let event_pump = sdl_context.event_pump()
+            .map_err(|e| PlayerError::Sdl(format!("Failed to create event pump: {}", e)))?;
 
+        // Create window
         let window = video_subsystem
             .window(title, width, height)
             .position_centered()
             .resizable()
             .build()
-            .map_err(|e| PlayerError::Sdl(e.to_string()))?;
+            .map_err(|e| PlayerError::Sdl(format!("Failed to create window: {}", e)))?;
 
+        // Create accelerated canvas with vsync
         let canvas = window
             .into_canvas()
             .accelerated()
             .present_vsync()
             .build()
-            .map_err(|e| PlayerError::Sdl(e.to_string()))?;
+            .map_err(|e| PlayerError::Sdl(format!("Failed to create canvas: {}", e)))?;
 
         let renderer = VideoRenderer::new(canvas, video_receiver)?;
 
+        println!("✅ SDL2 initialized successfully");
+
         Ok(VideoWindow {
-            sdl_context,
-            video_subsystem,
             event_pump,
             renderer,
+            _sdl_context: sdl_context,
+            _video_subsystem: video_subsystem,
         })
     }
 }
